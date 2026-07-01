@@ -1,0 +1,10 @@
+# Torch/torchvision must be installed separately with CUDA support matching your GPU driver, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+opencv-python
+numpy
+pyyaml
+fastapi
+uvicorn
+mediapipe
+huggingface_hub
+tqdm

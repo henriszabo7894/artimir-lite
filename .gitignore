@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+commands_history.txt
+.DS_Store
+
+weights/
+debug_tensor_output.jpg
+audio/
+output/
+
+# récupérés via setup_liveportrait.py / download_assets.py
+liveportrait_src/
+joconde.jpg
+vangogh.jpg
+courbet.jpg
+driving_narration.mp4
