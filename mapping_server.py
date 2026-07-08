@@ -8,17 +8,68 @@ import signal
 import math
 import wave
 import numpy as np
+from collections import deque
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from fastapi.responses import RedirectResponse
 
 narration_cap = cv2.VideoCapture("driving_narration.mp4")
 
+# N'appelle LivePortrait que sur 1 frame webcam sur N en mode live (hors narration/freeze)
+PROCESS_EVERY_N = 3
+
+# Profiling temporaire (diagnostic goulot d'étranglement) : ARTIMIR_PROFILE=1
+_PROFILE = os.environ.get("ARTIMIR_PROFILE") == "1"
+_PROFILE_WINDOW = 30
+
+_prof_loop = {
+    k: deque(maxlen=_PROFILE_WINDOW)
+    for k in ("webcam_read", "resize", "generate_frame", "parallax", "ffmpeg_write", "imshow", "loop_total")
+}
+_prof_loop_count = 0
+
+_prof_jpeg = deque(maxlen=_PROFILE_WINDOW)
+_prof_jpeg_count = 0
+
+
+def _log_prof_loop():
+    avgs = {k: (sum(v) / len(v)) * 1000 if v else 0.0 for k, v in _prof_loop.items()}
+    print(
+        "[PROFILE main_loop] moy/{}f (ms) — webcam_read:{:.1f} resize:{:.1f} "
+        "generate_frame:{:.1f} parallax:{:.1f} ffmpeg_write:{:.1f} imshow:{:.1f} | loop_total:{:.1f}".format(
+            _PROFILE_WINDOW,
+            avgs["webcam_read"], avgs["resize"], avgs["generate_frame"], avgs["parallax"],
+            avgs["ffmpeg_write"], avgs["imshow"], avgs["loop_total"]
+        )
+    )
+
+
+def _log_prof_jpeg():
+    avg = (sum(_prof_jpeg) / len(_prof_jpeg)) * 1000 if _prof_jpeg else 0.0
+    print(f"[PROFILE video_feed] moy/{_PROFILE_WINDOW}f (ms) — jpeg_encode:{avg:.1f}")
+
 try:
     from ai_engine import PortraitAnimator
 except ImportError:
     print("[-] ERREUR : 'ai_engine.py' est introuvable.")
     exit()
+
+try:
+    from parallax_effect import EffetParallaxe
+    _PARALLAX_OK = True
+except ImportError:
+    _PARALLAX_OK = False
+    print("[WARN] parallax_effect.py introuvable — effet de parallaxe désactivé")
+
+# Réglages validés en démo autonome (intensite_px, flou_depth_kernel) par tableau
+PARALLAX_SETTINGS = {
+    "joconde": {"intensite_px": 20.0, "flou_depth_kernel": 300},
+    "vangogh": {"intensite_px": 10.0, "flou_depth_kernel": 500},
+    "courbet": {"intensite_px": 10.0, "flou_depth_kernel": 300},
+}
+
+# Rempli une seule fois au démarrage dans main_loop() ; partagé avec la route API
+parallax_effects = {}
 
 try:
     import mediapipe as mp
@@ -448,11 +499,21 @@ def generate_video_stream():
             # On réduit le flux envoyé au Raspberry
             frame = cv2.resize(frame, (640, 640))
 
+            if _PROFILE:
+                t_jpeg0 = time.perf_counter()
+
             ok, buffer = cv2.imencode(
                 ".jpg",
                 frame,
                 [int(cv2.IMWRITE_JPEG_QUALITY), 45]
             )
+
+            if _PROFILE:
+                global _prof_jpeg_count
+                _prof_jpeg.append(time.perf_counter() - t_jpeg0)
+                _prof_jpeg_count += 1
+                if _prof_jpeg_count % _PROFILE_WINDOW == 0:
+                    _log_prof_jpeg()
 
             if ok:
                 yield (
@@ -513,6 +574,18 @@ def fullscreen_display():
 </body>
 </html>
 """
+@app.post("/api/parallaxe/intensite")
+def set_parallaxe_intensite(tableau: str, px: float):
+    effect = parallax_effects.get(tableau)
+
+    if effect is None:
+        raise HTTPException(status_code=400, detail=f"Parallaxe inconnue ou non initialisée pour '{tableau}'")
+
+    effect.set_intensite(px)
+    print(f"[API] PARALLAXE {tableau} -> intensite_px={px}")
+    return {"status": "ok", "tableau": tableau, "intensite_px": px}
+
+
 @app.post("/command/age/{age_group}")
 def set_age(age_group: str):
     if age_group not in ("enfant", "ado", "adulte"):
@@ -702,6 +775,16 @@ def main_loop():
         else:
             print(f"[ALERTE] Fichier manquant : {path}")
 
+    if _PARALLAX_OK:
+        for name, settings in PARALLAX_SETTINGS.items():
+            depth_path = f"{name}_depth.npy"
+
+            if os.path.exists(depth_path):
+                parallax_effects[name] = EffetParallaxe(depth_path, **settings)
+                print(f"[INIT] Parallaxe {name} chargée ({depth_path}).")
+            else:
+                print(f"[ALERTE] Carte de profondeur manquante : {depth_path}")
+
     cap = cv2.VideoCapture(0)
     
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -720,10 +803,14 @@ def main_loop():
 
     current_artwork_name = None
     source_img = None
+    live_frame_counter = 0
 
     print("\n[MOTEUR] Serveur Mapping prêt. En attente du Raspberry Pi...")
 
     while True:
+        if _PROFILE:
+            t_loop0 = time.perf_counter()
+
         with state.lock:
             if not state.running:
                 break
@@ -749,7 +836,13 @@ def main_loop():
                 current_artwork_name = target_artwork
                 print(f"[MOTEUR] Bascule sur : {target_artwork}")
 
+        if _PROFILE:
+            t_read0 = time.perf_counter()
+
         ret, frame = cap.read()
+
+        if _PROFILE:
+            _prof_loop["webcam_read"].append(time.perf_counter() - t_read0)
 
         if not ret:
             print("[-] ERREUR : impossible de lire la webcam.")
@@ -784,11 +877,28 @@ def main_loop():
                     final_frame = state.last_frame.copy() if state.last_frame is not None else source_img.copy()
 
             else:
-                driving_resized = cv2.resize(frame, (512, 512))
-                final_frame = animator.generate_frame(source_img, driving_resized)
+                live_frame_counter += 1
 
-                with state.lock:
-                    state.last_frame = final_frame.copy()
+                if live_frame_counter % PROCESS_EVERY_N == 0:
+                    if _PROFILE:
+                        t_resize0 = time.perf_counter()
+
+                    driving_resized = cv2.resize(frame, (512, 512))
+
+                    if _PROFILE:
+                        t_gen0 = time.perf_counter()
+                        _prof_loop["resize"].append(t_gen0 - t_resize0)
+
+                    final_frame = animator.generate_frame(source_img, driving_resized)
+
+                    if _PROFILE:
+                        _prof_loop["generate_frame"].append(time.perf_counter() - t_gen0)
+
+                    with state.lock:
+                        state.last_frame = final_frame.copy()
+                else:
+                    with state.lock:
+                        final_frame = state.last_frame.copy() if state.last_frame is not None else source_img.copy()
 
         else:
             final_frame = frame
@@ -805,12 +915,36 @@ def main_loop():
             with state.lock:
                 state.capture_requested = False
 
+        if _PROFILE:
+            t_parallax0 = time.perf_counter()
+
+        udp_frame = final_frame
+        effect = parallax_effects.get(current_artwork_name)
+        if effect is not None:
+            udp_frame = effect.appliquer(udp_frame, animator.last_yaw_deg, animator.last_pitch_deg)
+
+        if _PROFILE:
+            t_ffmpeg0 = time.perf_counter()
+            _prof_loop["parallax"].append(t_ffmpeg0 - t_parallax0)
+
         try:
-            ffmpeg_stream.stdin.write(final_frame.tobytes())
+            ffmpeg_stream.stdin.write(udp_frame.tobytes())
         except Exception:
             pass
 
+        if _PROFILE:
+            t_imshow0 = time.perf_counter()
+            _prof_loop["ffmpeg_write"].append(t_imshow0 - t_ffmpeg0)
+
         cv2.imshow("ARTIMIR - SERVEUR GPU", final_frame)
+
+        if _PROFILE:
+            global _prof_loop_count
+            _prof_loop["imshow"].append(time.perf_counter() - t_imshow0)
+            _prof_loop["loop_total"].append(time.perf_counter() - t_loop0)
+            _prof_loop_count += 1
+            if _prof_loop_count % _PROFILE_WINDOW == 0:
+                _log_prof_loop()
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break

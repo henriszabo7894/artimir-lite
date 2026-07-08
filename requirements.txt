@@ -8,3 +8,6 @@ uvicorn
 mediapipe
 huggingface_hub
 tqdm
+requests
+faster-whisper
+python-multipart
