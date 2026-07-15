@@ -35,3 +35,16 @@ install_log*.txt
 *_depth.npy
 *_depth.png
 blink_calibration*.png
+
+# générateur de souvenir : poids/modèles téléchargés + caches regénérables
+models/adain/
+models/face_landmarker.task
+souvenir_data/
+test_frames/
+models/sdxl_inpainting/
+models/ip_adapter/
+models/controlnet_depth_sdxl/
+
+# photos de test (visages) : non versionnées
+test_frames_dark/
+face_test.jpg

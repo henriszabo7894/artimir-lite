@@ -11,3 +11,9 @@ tqdm
 requests
 faster-whisper
 python-multipart
+# Génération de souvenir (SDXL inpainting + AdaIN)
+diffusers
+accelerate
+transformers
+# Differential Diffusion : extraction depth (fallback si {artwork}_depth.npy absent)
+controlnet_aux
