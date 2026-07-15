@@ -80,6 +80,60 @@ except (ImportError, AttributeError):
     print("[WARN] mediapipe non installé — coordonnées visage fixes (pip install mediapipe)")
 
 
+# ======================================================================== #
+# SESSION SOUVENIR                                                          #
+# ======================================================================== #
+# Durée d'une session visiteur avant génération automatique du souvenir.
+# La logique de session côté site (Artimir-Web) parle le même protocole :
+# statuts "active" -> "generating" -> "resultReady".
+SESSION_TIME = 300.0            # secondes avant capture automatique
+SESSION_SAMPLE_INTERVAL = 1.0   # échantillonnage d'un frame webcam toutes les N s
+SESSION_TOP_K = 10              # nb de meilleurs candidats gardés en mémoire
+
+# Statuts de session (alignés sur SESSION_STATUSES côté site web).
+SESSION_IDLE = "idle"
+SESSION_ACTIVE = "active"
+SESSION_GENERATING = "generating"
+SESSION_RESULT_READY = "resultReady"
+SESSION_ERROR = "error"
+
+# Images pleine résolution des tableaux (le souvenir travaille sur la toile
+# native, pas sur le crop 512² utilisé par LivePortrait).
+ARTWORK_FILES = {
+    "joconde": "joconde.jpg",
+    "vangogh": "vangogh.jpg",
+    "courbet": "courbet.jpg",
+}
+
+SOUVENIR_DIR = "output"
+
+# SouvenirGenerator instancié paresseusement (import lourd : torch, diffusers,
+# mediapipe). Partagé entre le scoring live et la génération finale.
+_souvenir_generator = None
+_generator_lock = threading.Lock()
+
+
+def get_souvenir_generator():
+    """Retourne le SouvenirGenerator partagé (chargé à la première demande).
+
+    Retourne None si le module ne peut pas être importé (dépendances absentes) :
+    le scoring live et la génération dégradent alors proprement.
+    """
+    global _souvenir_generator
+
+    with _generator_lock:
+        if _souvenir_generator is None:
+            try:
+                from souvenir_generator import SouvenirGenerator
+                _souvenir_generator = SouvenirGenerator()
+                print("[SOUVENIR] SouvenirGenerator initialisé.")
+            except Exception as exc:
+                print(f"[SOUVENIR] Import/instanciation impossible ({exc}).")
+                _souvenir_generator = False
+
+    return _souvenir_generator or None
+
+
 class EngineState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -90,6 +144,7 @@ class EngineState:
         self.output_path = "output/portrait.jpg"
         self.last_frame = None
         self.stream_frame = None
+        self.webcam_frame = None          # dernier frame webcam BRUT (visage réel visiteur)
         self.valid_artworks = ["joconde", "vangogh", "courbet"]
 
         self.narration_process = None
@@ -101,6 +156,19 @@ class EngineState:
         self.narration_base_frame = None  # image propre figée au démarrage narration
         self.face_zones = None            # {"mouth": (x1,y1,x2,y2), "eyes": (x1,y1,x2,y2)}
         self.age_group = "adulte"         # enfant | ado | adulte
+
+        # --- Session souvenir ---
+        self.session_id = None
+        self.session_active = False
+        self.session_status = SESSION_IDLE
+        self.session_start_time = 0.0
+        self.session_capture_requested = False
+        self.session_gender_override = None   # câblé plus tard depuis le site
+        # Top-K meilleurs candidats accumulés au fil de la session : liste de
+        # tuples (score, frame_bgr). Vidée explicitement en fin de session.
+        self.souvenir_buffer = []
+        self.souvenir_path = None             # chemin du dernier souvenir généré
+        self.souvenir_results = {}            # session_id -> chemin fichier
 
 
 state = EngineState()
@@ -488,7 +556,10 @@ def get_status():
             "artwork": state.artwork,
             "narration_active": state.narration_active,
             "narration_paused": state.narration_paused,
-            "last_capture": state.output_path if os.path.exists(state.output_path) else None
+            "last_capture": state.output_path if os.path.exists(state.output_path) else None,
+            "session_id": state.session_id,
+            "session_status": state.session_status,
+            "session_active": state.session_active,
         }
 def generate_video_stream():
     while True:
@@ -720,6 +791,213 @@ def narration_stop():
     return {"status": "ok", "action": "narration_stop"}
 
 
+# ======================================================================== #
+# SESSION SOUVENIR — logique                                               #
+# ======================================================================== #
+def _insert_topk(buffer, score, frame):
+    """Insère (score, frame) dans le buffer top-K trié par score décroissant.
+
+    Ne garde que les SESSION_TOP_K meilleurs candidats -> RAM bornée et
+    sélection finale rapide. Modifie le buffer en place.
+    """
+    buffer.append((float(score), frame))
+    buffer.sort(key=lambda item: item[0], reverse=True)
+    del buffer[SESSION_TOP_K:]
+
+
+def start_session(artwork=None):
+    """Démarre une session visiteur : vide le buffer, arme le timer, statut actif."""
+    import uuid
+    session_id = uuid.uuid4().hex[:12]
+
+    with state.lock:
+        if artwork in state.valid_artworks:
+            state.artwork = artwork
+            state.frozen = False
+        previous = len(state.souvenir_buffer)
+        state.souvenir_buffer = []            # Tâche 3 : départ propre
+        state.session_id = session_id
+        state.session_active = True
+        state.session_status = SESSION_ACTIVE
+        state.session_start_time = time.time()
+        state.session_capture_requested = False
+        state.souvenir_path = None
+        current_artwork = state.artwork
+
+    print(f"[SESSION] START id={session_id} artwork={current_artwork} "
+          f"(buffer précédent purgé : {previous} frame(s))")
+    return session_id
+
+
+def finalize_session(session_id):
+    """Fin de session : sélectionne le meilleur frame, génère le souvenir,
+    l'écrit sur disque et l'expose. Vide toujours le buffer (Tâche 3).
+    """
+    with state.lock:
+        frames = [frame for (_score, frame) in state.souvenir_buffer]
+        buffer_size = len(state.souvenir_buffer)
+        artwork = state.artwork
+        gender_override = state.session_gender_override
+        prev_frozen = state.frozen
+        state.session_status = SESSION_GENERATING
+        state.session_capture_requested = False
+        state.frozen = True   # libère le GPU (stoppe LivePortrait) pendant SDXL
+
+    print(f"[SESSION] {session_id} -> GENERATING "
+          f"({buffer_size} candidat(s) bufferisés, artwork={artwork})")
+
+    result_path = None
+    try:
+        generator = get_souvenir_generator()
+        if generator is None:
+            raise RuntimeError("SouvenirGenerator indisponible")
+
+        artwork_file = ARTWORK_FILES.get(artwork, f"{artwork}.jpg")
+        artwork_bgr = cv2.imread(artwork_file)
+        if artwork_bgr is None:
+            raise RuntimeError(f"Tableau introuvable : {artwork_file}")
+
+        final = generator.generate_souvenir(
+            frames, artwork, artwork_bgr, gender_override=gender_override,
+        )
+
+        os.makedirs(SOUVENIR_DIR, exist_ok=True)
+        result_path = os.path.join(SOUVENIR_DIR, f"souvenir_{session_id}.jpg")
+        cv2.imwrite(result_path, final)
+        method = getattr(generator, "last_method", None) or "inconnue"
+        print(f"[SESSION] {session_id} -> resultReady : {result_path} "
+              f"({final.shape[1]}x{final.shape[0]}, méthode={method})")
+
+        with state.lock:
+            state.souvenir_results[session_id] = result_path
+            state.souvenir_path = result_path
+            state.session_status = SESSION_RESULT_READY
+    except Exception as exc:
+        print(f"[SESSION] {session_id} -> ERROR génération souvenir : {exc}")
+        with state.lock:
+            state.session_status = SESSION_ERROR
+    finally:
+        # Tâche 3 : purge explicite du buffer, quel que soit le résultat, pour
+        # qu'aucun visage d'un visiteur ne fuite dans une session ultérieure.
+        with state.lock:
+            cleared = len(state.souvenir_buffer)
+            state.souvenir_buffer = []
+            state.session_active = False
+            state.frozen = prev_frozen
+        print(f"[SESSION] {session_id} -> buffer vidé "
+              f"({cleared} frame(s) libérée(s)), session close.")
+
+    return result_path
+
+
+def session_worker():
+    """Thread persistant : échantillonne/scoring des frames webcam pendant une
+    session active, et déclenche la génération à SESSION_TIME (ou sur demande
+    explicite). Le scoring MediaPipe tourne hors du lock (lent)."""
+    while True:
+        with state.lock:
+            if not state.running:
+                break
+            active = state.session_active
+            status = state.session_status
+            start_time = state.session_start_time
+            session_id = state.session_id
+            capture_req = state.session_capture_requested
+            raw = state.webcam_frame.copy() if state.webcam_frame is not None else None
+
+        if active and status == SESSION_ACTIVE:
+            elapsed = time.time() - start_time
+
+            if capture_req or elapsed >= SESSION_TIME:
+                reason = "capture explicite" if capture_req else f"timeout {SESSION_TIME:.0f}s"
+                print(f"[SESSION] {session_id} -> fin de session ({reason})")
+                finalize_session(session_id)
+            elif raw is not None:
+                generator = get_souvenir_generator()
+                if generator is not None:
+                    try:
+                        score = generator.score_frame(raw)  # hors lock
+                    except Exception:
+                        score = 0.0
+                    with state.lock:
+                        # La session peut avoir changé pendant le scoring : on
+                        # ne buffer que si elle est toujours la même et active.
+                        if state.session_active and state.session_id == session_id:
+                            _insert_topk(state.souvenir_buffer, score, raw)
+
+        time.sleep(SESSION_SAMPLE_INTERVAL)
+
+    print("[SESSION] worker arrêté.")
+
+
+@app.post("/command/session/start")
+def session_start(artwork: str = None):
+    if artwork is not None and artwork not in state.valid_artworks:
+        raise HTTPException(status_code=400, detail=f"Artwork '{artwork}' inconnu")
+
+    session_id = start_session(artwork)
+
+    with state.lock:
+        current_artwork = state.artwork
+
+    return {
+        "status": "ok",
+        "action": "session_start",
+        "session_id": session_id,
+        "artwork": current_artwork,
+        "session_status": SESSION_ACTIVE,
+    }
+
+
+@app.post("/command/session/capture")
+def session_capture():
+    """Déclenche immédiatement la fin de session + génération du souvenir."""
+    with state.lock:
+        if not state.session_active:
+            raise HTTPException(status_code=409, detail="Aucune session active")
+        state.session_capture_requested = True
+        session_id = state.session_id
+
+    print(f"[SESSION] {session_id} -> capture demandée explicitement")
+    return {"status": "ok", "action": "session_capture", "session_id": session_id}
+
+
+@app.get("/command/session/status")
+def session_status_endpoint():
+    with state.lock:
+        session_id = state.session_id
+        status = state.session_status
+        active = state.session_active
+        start_time = state.session_start_time
+        ready = status == SESSION_RESULT_READY
+
+    elapsed = round(time.time() - start_time, 1) if active else 0.0
+    return {
+        "session_id": session_id,
+        "session_status": status,
+        "active": active,
+        "elapsed": elapsed,
+        "session_time": SESSION_TIME,
+        "result_ready": ready,
+        "souvenir_url": f"/souvenir/{session_id}" if ready else None,
+    }
+
+
+@app.get("/souvenir/{session_id}")
+def get_souvenir(session_id: str):
+    with state.lock:
+        path = state.souvenir_results.get(session_id)
+
+    if path and os.path.exists(path):
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            filename=f"souvenir_{session_id}.jpg",
+        )
+
+    raise HTTPException(status_code=404, detail="Souvenir non disponible")
+
+
 def run_server():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
@@ -799,6 +1077,7 @@ def main_loop():
         return
 
     threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=session_worker, daemon=True).start()
     ffmpeg_stream = start_ffmpeg_stream()
 
     current_artwork_name = None
@@ -905,6 +1184,8 @@ def main_loop():
         
         with state.lock:
             state.stream_frame = final_frame.copy()
+            # Frame webcam BRUT (visage réel du visiteur) pour le buffer souvenir.
+            state.webcam_frame = frame.copy()
 
         if capture_req:
             os.makedirs("output", exist_ok=True)
